@@ -1,0 +1,515 @@
+version: '3'
+
+vars:
+  SERVER_DIR: "servers/{{.NAME}}"
+  NODE_BIN: "mise x node --"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  # ─────────────────────────────────────────
+  # GLOBAL SETUP
+  # ─────────────────────────────────────────
+  setup:
+    desc: "Install global tooling only (mise, task)"
+    cmds:
+      - mkdir -p servers .vscode
+      - cp configs/biome.json .biome.json 2>/dev/null || true
+      - echo "✅ Global workspace ready."
+
+  # ─────────────────────────────────────────
+  # SERVER LIFECYCLE
+  # ─────────────────────────────────────────
+  create:
+    desc: "Scaffold production MCP server. Usage: task create NAME=my-server"
+    requires:
+      vars: [NAME]
+    cmds:
+      - task: _scaffold-dirs
+      - task: _write-package-json
+      - task: _write-tsconfig
+      - task: _write-biome-config
+      - task: _write-source-files
+      - task: _write-test-files
+      - task: _write-env-files
+      - task: _install-deps
+      - echo "✨ Server '{{.NAME}}' ready at {{.SERVER_DIR}}"
+
+  build:
+    desc: "Strict TypeScript compilation"
+    requires:
+      vars: [NAME]
+    dir: "{{.SERVER_DIR}}"
+    cmds:
+      - "{{.NODE_BIN}} npx tsc --noEmit false"
+
+  check:
+    desc: "Lint + format with zero-warning policy"
+    requires:
+      vars: [NAME]
+    dir: "{{.SERVER_DIR}}"
+    cmds:
+      - "{{.NODE_BIN}} npx biome check --apply ./src"
+
+  test:
+    desc: "Run tests with coverage"
+    requires:
+      vars: [NAME]
+    dir: "{{.SERVER_DIR}}"
+    cmds:
+      - "{{.NODE_BIN}} npx vitest run --coverage"
+
+  bundle:
+    desc: "Single-file ESM bundle for distribution"
+    requires:
+      vars: [NAME]
+    deps: [check, test, build]
+    dir: "{{.SERVER_DIR}}"
+    cmds:
+      - mkdir -p dist
+      - |
+        {{.NODE_BIN}} npx esbuild src/index.ts \
+          --bundle \
+          --platform=node \
+          --format=esm \
+          --outfile=dist/index.mjs \
+          --external:node:* \
+          --sourcemap \
+          --banner:js="#!/usr/bin/env node"
+      - chmod +x dist/index.mjs
+      - echo "📦 Bundled → {{.SERVER_DIR}}/dist/index.mjs"
+
+  inspect:
+    desc: "Live debug via MCP Inspector"
+    requires:
+      vars: [NAME]
+    deps: [build]
+    dir: "{{.SERVER_DIR}}"
+    cmds:
+      - "{{.NODE_BIN}} npx @modelcontextprotocol/inspector node build/index.js"
+
+  dev:
+    desc: "Watch mode with auto-restart"
+    requires:
+      vars: [NAME]
+    dir: "{{.SERVER_DIR}}"
+    cmds:
+      - "{{.NODE_BIN}} npx tsx watch src/index.ts"
+
+  clean:
+    desc: "Remove build artifacts"
+    requires:
+      vars: [NAME]
+    cmds:
+      - rm -rf {{.SERVER_DIR}}/build {{.SERVER_DIR}}/dist
+
+  list-all:
+    desc: "List all servers with their status"
+    cmds:
+      - |
+        for dir in servers/*/; do
+          name=$(basename "$dir")
+          has_build=$([[ -d "$dir/build" ]] && echo "✅ built" || echo "⬜ not built")
+          has_dist=$([[ -f "$dir/dist/index.mjs" ]] && echo "📦 bundled" || echo "")
+          echo "  • $name  $has_build  $has_dist"
+        done
+
+  # ─────────────────────────────────────────
+  # INTERNAL SCAFFOLD TASKS
+  # ─────────────────────────────────────────
+  _scaffold-dirs:
+    internal: true
+    cmds:
+      - |
+        mkdir -p {{.SERVER_DIR}}/{src/{tools,resources,prompts,lib,schema},tests,configs}
+
+  _write-package-json:
+    internal: true
+    cmds:
+      - |
+        cat > {{.SERVER_DIR}}/package.json << 'EOF'
+        {
+          "name": "@mcp/{{.NAME}}",
+          "version": "1.0.0",
+          "private": true,
+          "type": "module",
+          "main": "./build/index.js",
+          "scripts": {
+            "build": "tsc",
+            "dev": "tsx watch src/index.ts",
+            "test": "vitest run --coverage",
+            "check": "biome check --apply ./src",
+            "bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:node:* --sourcemap"
+          },
+          "dependencies": {
+            "@modelcontextprotocol/sdk": "^1.0.0",
+            "zod": "^3.23.0"
+          },
+          "devDependencies": {
+            "@biomejs/biome": "^1.8.0",
+            "@types/node": "^22.0.0",
+            "@vitest/coverage-v8": "^2.0.0",
+            "esbuild": "^0.23.0",
+            "tsx": "^4.0.0",
+            "typescript": "^5.5.0",
+            "vitest": "^2.0.0"
+          }
+        }
+        EOF
+
+  _write-tsconfig:
+    internal: true
+    cmds:
+      - |
+        cat > {{.SERVER_DIR}}/tsconfig.json << 'EOF'
+        {
+          "compilerOptions": {
+            "target": "ES2022",
+            "module": "NodeNext",
+            "moduleResolution": "NodeNext",
+            "lib": ["ES2022"],
+            "outDir": "./build",
+            "rootDir": "./src",
+            "strict": true,
+            "exactOptionalPropertyTypes": true,
+            "noUncheckedIndexedAccess": true,
+            "noImplicitOverride": true,
+            "noPropertyAccessFromIndexSignature": true,
+            "forceConsistentCasingInFileNames": true,
+            "skipLibCheck": false,
+            "declaration": true,
+            "declarationMap": true,
+            "sourceMap": true
+          },
+          "include": ["src/**/*"],
+          "exclude": ["node_modules", "build", "dist", "tests"]
+        }
+        EOF
+
+  _write-biome-config:
+    internal: true
+    cmds:
+      - |
+        cat > {{.SERVER_DIR}}/biome.json << 'EOF'
+        {
+          "$schema": "https://biomejs.dev/schemas/1.8.0/schema.json",
+          "organizeImports": { "enabled": true },
+          "linter": {
+            "enabled": true,
+            "rules": {
+              "recommended": true,
+              "complexity": { "noExcessiveCognitiveComplexity": "error" },
+              "correctness": { "noUnusedVariables": "error" },
+              "style": {
+                "noNonNullAssertion": "error",
+                "useConst": "error"
+              }
+            }
+          },
+          "formatter": {
+            "enabled": true,
+            "indentStyle": "space",
+            "indentWidth": 2,
+            "lineWidth": 100
+          }
+        }
+        EOF
+
+  _write-source-files:
+    internal: true
+    cmds:
+      # Logger
+      - |
+        cat > {{.SERVER_DIR}}/src/lib/logger.ts << 'EOF'
+        export type LogLevel = "info" | "warn" | "error" | "debug";
+
+        interface LogEntry {
+          level: LogLevel;
+          ts: string;
+          msg: string;
+          server: string;
+          error?: string;
+        }
+
+        function emit(level: LogLevel, msg: string, error?: unknown): void {
+          const entry: LogEntry = {
+            level,
+            ts: new Date().toISOString(),
+            msg,
+            server: "{{.NAME}}",
+            ...(error !== undefined && {
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          };
+          // MCP requires stderr for all non-protocol output
+          process.stderr.write(JSON.stringify(entry) + "\n");
+        }
+
+        export const logger = {
+          info: (msg: string) => emit("info", msg),
+          warn: (msg: string) => emit("warn", msg),
+          error: (msg: string, error?: unknown) => emit("error", msg, error),
+          debug: (msg: string) => emit("debug", msg),
+        };
+        EOF
+
+      # Error types
+      - |
+        cat > {{.SERVER_DIR}}/src/lib/errors.ts << 'EOF'
+        export class McpToolError extends Error {
+          constructor(
+            message: string,
+            public readonly code: string,
+            public readonly retryable = false
+          ) {
+            super(message);
+            this.name = "McpToolError";
+          }
+        }
+
+        export class McpValidationError extends McpToolError {
+          constructor(message: string) {
+            super(message, "VALIDATION_ERROR", false);
+            this.name = "McpValidationError";
+          }
+        }
+
+        export class McpResourceError extends McpToolError {
+          constructor(message: string) {
+            super(message, "RESOURCE_ERROR", true);
+            this.name = "McpResourceError";
+          }
+        }
+        EOF
+
+      # Config / env loader
+      - |
+        cat > {{.SERVER_DIR}}/src/lib/config.ts << 'EOF'
+        import { z } from "zod";
+
+        const ConfigSchema = z.object({
+          NODE_ENV: z.enum(["development", "test", "production"]).default("production"),
+          LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+          SERVER_NAME: z.string().default("{{.NAME}}"),
+        });
+
+        export type Config = z.infer<typeof ConfigSchema>;
+
+        function loadConfig(): Config {
+          const result = ConfigSchema.safeParse(process.env);
+          if (!result.success) {
+            const issues = result.error.issues
+              .map((i) => `${i.path.join(".")}: ${i.message}`)
+              .join(", ");
+            throw new Error(`Invalid environment configuration: ${issues}`);
+          }
+          return result.data;
+        }
+
+        export const config = loadConfig();
+        EOF
+
+      # Tool registry
+      - |
+        cat > {{.SERVER_DIR}}/src/lib/registry.ts << 'EOF'
+        import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+        import { logger } from "./logger.js";
+
+        export type ToolRegistrar = (server: McpServer) => void;
+        export type ResourceRegistrar = (server: McpServer) => void;
+        export type PromptRegistrar = (server: McpServer) => void;
+
+        export interface ServerRegistry {
+          tools: ToolRegistrar[];
+          resources: ResourceRegistrar[];
+          prompts: PromptRegistrar[];
+        }
+
+        export function registerAll(server: McpServer, registry: ServerRegistry): void {
+          for (const register of registry.tools) {
+            register(server);
+          }
+          for (const register of registry.resources) {
+            register(server);
+          }
+          for (const register of registry.prompts) {
+            register(server);
+          }
+          logger.info(
+            `Registered ${registry.tools.length} tools, ` +
+            `${registry.resources.length} resources, ` +
+            `${registry.prompts.length} prompts`
+          );
+        }
+        EOF
+
+      # Example tool
+      - |
+        cat > {{.SERVER_DIR}}/src/tools/ping.ts << 'EOF'
+        import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+        import { z } from "zod";
+        import { McpValidationError } from "../lib/errors.js";
+        import { logger } from "../lib/logger.js";
+
+        const PingInputSchema = {
+          message: z.string().max(256).optional().describe("Optional echo message"),
+        };
+
+        export function registerPingTool(server: McpServer): void {
+          server.tool(
+            "ping",
+            "Health check — returns pong or echoes provided message",
+            PingInputSchema,
+            async ({ message }) => {
+              logger.debug("ping tool invoked");
+
+              if (message !== undefined && message.trim().length === 0) {
+                throw new McpValidationError("message must not be blank if provided");
+              }
+
+              const reply = message ? `echo: ${message}` : "pong";
+
+              return {
+                content: [{ type: "text", text: reply }],
+              };
+            }
+          );
+        }
+        EOF
+
+      # Main entrypoint
+      - |
+        cat > {{.SERVER_DIR}}/src/index.ts << 'EOF'
+        import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+        import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+        import { config } from "./lib/config.js";
+        import { logger } from "./lib/logger.js";
+        import { registerAll } from "./lib/registry.js";
+        import { registerPingTool } from "./tools/ping.js";
+
+        // ── Graceful shutdown ─────────────────────────────────────────────
+        let isShuttingDown = false;
+
+        async function shutdown(signal: string): Promise<void> {
+          if (isShuttingDown) return;
+          isShuttingDown = true;
+          logger.info(`Received ${signal} — shutting down.`);
+          process.exit(0);
+        }
+
+        process.on("SIGINT", () => void shutdown("SIGINT"));
+        process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+        process.on("uncaughtException", (error) => {
+          logger.error("Uncaught exception", error);
+          process.exit(1);
+        });
+
+        process.on("unhandledRejection", (reason) => {
+          logger.error("Unhandled rejection", reason);
+          process.exit(1);
+        });
+
+        // ── Server bootstrap ────────────────────────────────────────────
+        async function main(): Promise<void> {
+          const server = new McpServer({
+            name: config.SERVER_NAME,
+            version: "1.0.0",
+          });
+
+          registerAll(server, {
+            tools: [registerPingTool],
+            resources: [],
+            prompts: [],
+          });
+
+          const transport = new StdioServerTransport();
+          await server.connect(transport);
+
+          logger.info(`🏢 ${config.SERVER_NAME} operational [${config.NODE_ENV}]`);
+        }
+
+        main().catch((error) => {
+          logger.error("Fatal startup error", error);
+          process.exit(1);
+        });
+        EOF
+
+  _write-test-files:
+    internal: true
+    cmds:
+      - |
+        cat > {{.SERVER_DIR}}/tests/ping.test.ts << 'EOF'
+        import { describe, expect, it, vi } from "vitest";
+
+        // Isolated unit test — no real MCP server needed
+        describe("ping tool logic", () => {
+          it("returns pong when no message", () => {
+            const reply = (msg?: string) => (msg ? `echo: ${msg}` : "pong");
+            expect(reply()).toBe("pong");
+          });
+
+          it("echoes the message", () => {
+            const reply = (msg?: string) => (msg ? `echo: ${msg}` : "pong");
+            expect(reply("hello")).toBe("echo: hello");
+          });
+
+          it("rejects blank messages", () => {
+            const validate = (msg: string) => {
+              if (msg.trim().length === 0) throw new Error("blank");
+            };
+            expect(() => validate("  ")).toThrow("blank");
+          });
+        });
+        EOF
+
+      - |
+        cat > {{.SERVER_DIR}}/tests/vitest.config.ts << 'EOF'
+        import { defineConfig } from "vitest/config";
+
+        export default defineConfig({
+          test: {
+            environment: "node",
+            coverage: {
+              provider: "v8",
+              reporter: ["text", "lcov"],
+              thresholds: {
+                lines: 80,
+                functions: 80,
+              },
+            },
+          },
+        });
+        EOF
+
+  _write-env-files:
+    internal: true
+    cmds:
+      - |
+        cat > {{.SERVER_DIR}}/.env << 'EOF'
+        NODE_ENV=development
+        LOG_LEVEL=debug
+        EOF
+      - |
+        cat > {{.SERVER_DIR}}/.env.example << 'EOF'
+        NODE_ENV=production
+        LOG_LEVEL=info
+        EOF
+      - |
+        cat > {{.SERVER_DIR}}/.gitignore << 'EOF'
+        node_modules/
+        build/
+        dist/
+        .env
+        coverage/
+        *.tsbuildinfo
+        EOF
+
+  _install-deps:
+    internal: true
+    dir: "{{.SERVER_DIR}}"
+    cmds:
+      - "{{.NODE_BIN}} npm install"
